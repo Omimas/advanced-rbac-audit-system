@@ -1,0 +1,1241 @@
+"""
+advanced-rbac-audit-system
+==========================
+Repo   : https://github.com/Omimas/advanced-rbac-audit-system/
+Lisans : MIT
+Python : 3.11+
+
+Kurulum:
+    pip install fastapi uvicorn sqlalchemy pydantic python-jose passlib bcrypt python-multipart
+Çalıştır:
+    python rbac_audit_system.py
+    # → http://localhost:8000/docs
+"""
+
+from __future__ import annotations
+
+# ─────────────────────────────────────────────
+# STANDART KÜTÜPHANELER
+# ─────────────────────────────────────────────
+import os, uuid, json, hashlib, logging
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from functools import wraps
+from typing import Any, Optional, List, Dict
+
+# ─────────────────────────────────────────────
+# ÜÇÜNCÜ TARAF KÜTÜPHANELER
+# ─────────────────────────────────────────────
+from fastapi import FastAPI, Depends, HTTPException, Request, status, BackgroundTasks
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Boolean, DateTime,
+    ForeignKey, Text, Enum as SAEnum, JSON, UniqueConstraint, Index, event
+)
+from sqlalchemy.orm import declarative_base, relationship, Session, sessionmaker
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import uvicorn
+
+# ─────────────────────────────────────────────
+# YAPILANDIRMA
+# ─────────────────────────────────────────────
+DATABASE_URL   = os.getenv("DATABASE_URL", "sqlite:///./rbac_audit.db")
+SECRET_KEY     = os.getenv("SECRET_KEY",   "CHANGE_ME_IN_PROD_USE_256BIT_RANDOM_KEY")
+ALGORITHM      = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES",  "30"))
+REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "10080"))  # 7 gün
+APP_VERSION    = "1.0.0"
+APP_TITLE      = "Advanced RBAC & Audit System"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("rbac_audit")
+
+# ─────────────────────────────────────────────
+# VERİTABANI
+# ─────────────────────────────────────────────
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    echo=False,
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ─────────────────────────────────────────────
+# ENUM'LAR
+# ─────────────────────────────────────────────
+class AuditSeverity(str, Enum):
+    LOW      = "LOW"
+    MEDIUM   = "MEDIUM"
+    HIGH     = "HIGH"
+    CRITICAL = "CRITICAL"
+
+class AuditResult(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILURE = "FAILURE"
+    DENIED  = "DENIED"
+
+class AuditAction(str, Enum):
+    LOGIN        = "LOGIN"
+    LOGOUT       = "LOGOUT"
+    CREATE       = "CREATE"
+    READ         = "READ"
+    UPDATE       = "UPDATE"
+    DELETE       = "DELETE"
+    ASSIGN_ROLE  = "ASSIGN_ROLE"
+    REVOKE_ROLE  = "REVOKE_ROLE"
+    GRANT_PERM   = "GRANT_PERM"
+    REVOKE_PERM  = "REVOKE_PERM"
+    EXPORT       = "EXPORT"
+    TOKEN_REFRESH= "TOKEN_REFRESH"
+    ACCESS_DENIED= "ACCESS_DENIED"
+
+# ─────────────────────────────────────────────
+# VERİTABANI MODELLERİ (ORM)
+# ─────────────────────────────────────────────
+
+class User(Base):
+    __tablename__ = "users"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    uid          = Column(String(36), unique=True, default=lambda: str(uuid.uuid4()))
+    username     = Column(String(64), unique=True, nullable=False, index=True)
+    email        = Column(String(255), unique=True, nullable=False, index=True)
+    full_name    = Column(String(128))
+    hashed_password = Column(String(256), nullable=False)
+    is_active    = Column(Boolean, default=True)
+    is_locked    = Column(Boolean, default=False)
+    failed_login_attempts = Column(Integer, default=0)
+    last_login   = Column(DateTime(timezone=True))
+    password_changed_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                          onupdate=lambda: datetime.now(timezone.utc))
+    metadata_    = Column("metadata", JSON, default=dict)
+
+    user_roles   = relationship("UserRole",   back_populates="user", cascade="all, delete-orphan")
+    audit_logs   = relationship("AuditLog",   back_populates="user")
+    token_blacklist = relationship("TokenBlacklist", back_populates="user", cascade="all, delete-orphan")
+
+    @property
+    def roles(self) -> List["Role"]:
+        return [ur.role for ur in self.user_roles if ur.is_active]
+
+    def __repr__(self):
+        return f"<User id={self.id} username={self.username!r}>"
+
+
+class Role(Base):
+    __tablename__ = "roles"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    name        = Column(String(64), unique=True, nullable=False, index=True)
+    display_name= Column(String(128))
+    description = Column(Text)
+    is_active   = Column(Boolean, default=True)
+    is_system   = Column(Boolean, default=False)   # Sistem rolleri silinemez
+    parent_id   = Column(Integer, ForeignKey("roles.id"), nullable=True)
+    created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    parent      = relationship("Role", remote_side="Role.id", backref="children")
+    role_permissions = relationship("RolePermission", back_populates="role", cascade="all, delete-orphan")
+    user_roles  = relationship("UserRole", back_populates="role")
+
+    @property
+    def permissions(self) -> List["Permission"]:
+        own = [rp.permission for rp in self.role_permissions if rp.is_active]
+        if self.parent:
+            own += self.parent.permissions  # Miras alma
+        return list({p.id: p for p in own}.values())  # Tekrarları kaldır
+
+    def __repr__(self):
+        return f"<Role id={self.id} name={self.name!r}>"
+
+
+class Permission(Base):
+    __tablename__ = "permissions"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    name        = Column(String(128), unique=True, nullable=False, index=True)  # resource:action
+    resource    = Column(String(64), nullable=False, index=True)
+    action      = Column(String(64), nullable=False)
+    description = Column(Text)
+    is_active   = Column(Boolean, default=True)
+    created_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("resource", "action", name="uq_resource_action"),
+    )
+
+    role_permissions = relationship("RolePermission", back_populates="permission")
+
+    def __repr__(self):
+        return f"<Permission {self.resource}:{self.action}>"
+
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+
+    id            = Column(Integer, primary_key=True)
+    role_id       = Column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), nullable=False)
+    permission_id = Column(Integer, ForeignKey("permissions.id", ondelete="CASCADE"), nullable=False)
+    is_active     = Column(Boolean, default=True)
+    granted_at    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    granted_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("role_id", "permission_id", name="uq_role_permission"),
+    )
+
+    role          = relationship("Role", back_populates="role_permissions")
+    permission    = relationship("Permission", back_populates="role_permissions")
+
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+
+    id           = Column(Integer, primary_key=True)
+    user_id      = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    role_id      = Column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), nullable=False)
+    is_active    = Column(Boolean, default=True)
+    assigned_at  = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    assigned_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    expires_at   = Column(DateTime(timezone=True), nullable=True)  # Geçici rol desteği
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "role_id", name="uq_user_role"),
+    )
+
+    user         = relationship("User", foreign_keys=[user_id], back_populates="user_roles")
+    role         = relationship("Role", back_populates="user_roles")
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    log_id       = Column(String(36), unique=True, default=lambda: str(uuid.uuid4()))
+    timestamp    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    user_id      = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    username     = Column(String(64))                         # Snapshot (kullanıcı silinse de kalır)
+    action       = Column(SAEnum(AuditAction), nullable=False, index=True)
+    resource     = Column(String(64), nullable=False, index=True)
+    resource_id  = Column(String(128), nullable=True)
+    result       = Column(SAEnum(AuditResult), nullable=False, index=True)
+    severity     = Column(SAEnum(AuditSeverity), nullable=False, default=AuditSeverity.LOW)
+    ip_address   = Column(String(45))                         # IPv6 desteği
+    user_agent   = Column(Text)
+    session_id   = Column(String(128))
+    before_state = Column(JSON)
+    after_state  = Column(JSON)
+    extra        = Column(JSON)                               # Ek bağlamsal veri
+    error_detail = Column(Text)                               # Hata mesajı
+
+    __table_args__ = (
+        Index("ix_audit_user_ts", "user_id", "timestamp"),
+        Index("ix_audit_resource_ts", "resource", "timestamp"),
+        Index("ix_audit_result_severity", "result", "severity"),
+    )
+
+    user         = relationship("User", back_populates="audit_logs")
+
+
+class TokenBlacklist(Base):
+    __tablename__ = "token_blacklist"
+
+    id         = Column(Integer, primary_key=True)
+    jti        = Column(String(36), unique=True, nullable=False, index=True)  # JWT ID
+    user_id    = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    revoked_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    user = relationship("User", back_populates="token_blacklist")
+
+
+# ─────────────────────────────────────────────
+# GÜVENLİK ARAÇLARI
+# ─────────────────────────────────────────────
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
+bearer_scheme = HTTPBearer(auto_error=False)
+
+MAX_FAILED_ATTEMPTS = 5
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+def validate_password_strength(password: str) -> bool:
+    """En az 8 karakter, büyük/küçük harf, rakam ve özel karakter."""
+    import re
+    return bool(re.match(
+        r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$',
+        password
+    ))
+
+def create_token(data: dict, expires_delta: timedelta) -> str:
+    payload = {
+        **data,
+        "jti": str(uuid.uuid4()),
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + expires_delta,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Token geçersiz: {e}")
+
+def is_token_blacklisted(jti: str, db: Session) -> bool:
+    return db.query(TokenBlacklist).filter_by(jti=jti).first() is not None
+
+
+# ─────────────────────────────────────────────
+# DENETİM KAYIT MOTORU
+# ─────────────────────────────────────────────
+class AuditLogger:
+    """Her işlemi veritabanına atomik olarak kaydeder."""
+
+    def log(
+        self,
+        db: Session,
+        *,
+        action: AuditAction,
+        resource: str,
+        result: AuditResult,
+        user_id: Optional[int] = None,
+        username: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        severity: AuditSeverity = AuditSeverity.LOW,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        session_id: Optional[str] = None,
+        before_state: Optional[dict] = None,
+        after_state: Optional[dict] = None,
+        extra: Optional[dict] = None,
+        error_detail: Optional[str] = None,
+    ) -> AuditLog:
+        entry = AuditLog(
+            user_id=user_id,
+            username=username,
+            action=action,
+            resource=resource,
+            resource_id=str(resource_id) if resource_id else None,
+            result=result,
+            severity=severity,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            session_id=session_id,
+            before_state=before_state,
+            after_state=after_state,
+            extra=extra,
+            error_detail=error_detail,
+        )
+        db.add(entry)
+        db.flush()  # commit, çağıran tarafından yapılır
+        logger.info(
+            "[AUDIT] %s | user=%s | %s/%s | %s | %s",
+            action, username or user_id, resource, resource_id, result, severity
+        )
+        return entry
+
+
+audit_logger = AuditLogger()
+
+
+# ─────────────────────────────────────────────
+# İZİN KONTROL MOTORU
+# ─────────────────────────────────────────────
+class RBACEngine:
+    """Kullanıcı → Rol → İzin hiyerarşisini çözer."""
+
+    def get_user_permissions(self, user: User) -> List[str]:
+        """Tüm rolleri ve miras alınan izinleri birleştirir."""
+        all_perms: Dict[str, Permission] = {}
+        for role in user.roles:
+            for perm in role.permissions:
+                if perm.is_active:
+                    all_perms[perm.name] = perm
+        return list(all_perms.keys())
+
+    def has_permission(self, user: User, resource: str, action: str) -> bool:
+        """Wildcard (*) ve kesin eşleşme kontrolü."""
+        permissions = self.get_user_permissions(user)
+        checks = [
+            f"{resource}:{action}",
+            f"{resource}:*",
+            "*:*",
+        ]
+        return any(p in permissions for p in checks)
+
+    def check_or_raise(self, user: User, resource: str, action: str) -> None:
+        if not self.has_permission(user, resource, action):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Erişim reddedildi: '{resource}:{action}' izni gerekli.",
+            )
+
+
+rbac_engine = RBACEngine()
+
+
+# ─────────────────────────────────────────────
+# BAĞIMLILIK ENJEKSİYONLARI (FastAPI Depends)
+# ─────────────────────────────────────────────
+def get_request_meta(request: Request) -> dict:
+    """İstek metaverisini çıkarır (IP, UA, session)."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    ip = forwarded.split(",")[0].strip() if forwarded else (
+        request.client.host if request.client else "unknown"
+    )
+    return {
+        "ip_address": ip,
+        "user_agent": request.headers.get("User-Agent", "")[:512],
+        "session_id": request.headers.get("X-Session-Id"),
+    }
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Kimlik doğrulama gerekli.")
+
+    payload = decode_token(credentials.credentials)
+    jti = payload.get("jti")
+    if not jti or is_token_blacklisted(jti, db):
+        raise HTTPException(status_code=401, detail="Token iptal edilmiş.")
+
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Erişim tokeni gerekli.")
+
+    user_id = payload.get("sub")
+    user = db.query(User).filter_by(id=int(user_id), is_active=True, is_locked=False).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Kullanıcı bulunamadı veya devre dışı.")
+    return user
+
+
+def require_permission(resource: str, action: str):
+    """Dekoratör tarzı bağımlılık: belirtilen izni zorunlu kılar."""
+    def dependency(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ):
+        rbac_engine.check_or_raise(current_user, resource, action)
+        return current_user
+    return dependency
+
+
+# ─────────────────────────────────────────────
+# PYDANTIC ŞEMALARI
+# ─────────────────────────────────────────────
+
+# — Auth —
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = ACCESS_TOKEN_EXPIRE_MINUTES * 60
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+# — Kullanıcı —
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    email: str    = Field(max_length=255)
+    full_name: Optional[str] = None
+    password: str = Field(min_length=8)
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v):
+        if not validate_password_strength(v):
+            raise ValueError(
+                "Şifre en az 8 karakter, büyük/küçük harf, rakam ve özel karakter içermeli."
+            )
+        return v
+
+class UserUpdate(BaseModel):
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class UserOut(BaseModel):
+    id: int
+    uid: str
+    username: str
+    email: str
+    full_name: Optional[str]
+    is_active: bool
+    is_locked: bool
+    last_login: Optional[datetime]
+    created_at: datetime
+    roles: List[str] = []
+
+    class Config:
+        from_attributes = True
+
+    @classmethod
+    def from_orm_with_roles(cls, user: User):
+        return cls(
+            id=user.id, uid=user.uid, username=user.username,
+            email=user.email, full_name=user.full_name,
+            is_active=user.is_active, is_locked=user.is_locked,
+            last_login=user.last_login, created_at=user.created_at,
+            roles=[r.name for r in user.roles],
+        )
+
+# — Rol —
+class RoleCreate(BaseModel):
+    name: str        = Field(min_length=2, max_length=64)
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    parent_id: Optional[int] = None
+
+class RoleOut(BaseModel):
+    id: int
+    name: str
+    display_name: Optional[str]
+    description: Optional[str]
+    is_system: bool
+    parent_id: Optional[int]
+    permissions: List[str] = []
+
+    class Config:
+        from_attributes = True
+
+# — İzin —
+class PermissionCreate(BaseModel):
+    resource: str = Field(min_length=1, max_length=64)
+    action: str   = Field(min_length=1, max_length=64)
+    description: Optional[str] = None
+
+class PermissionOut(BaseModel):
+    id: int
+    name: str
+    resource: str
+    action: str
+    description: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+# — Rol Atama —
+class AssignRole(BaseModel):
+    role_id: int
+    expires_at: Optional[datetime] = None
+
+class AssignPermission(BaseModel):
+    permission_id: int
+
+# — Denetim —
+class AuditLogOut(BaseModel):
+    id: int
+    log_id: str
+    timestamp: datetime
+    username: Optional[str]
+    action: str
+    resource: str
+    resource_id: Optional[str]
+    result: str
+    severity: str
+    ip_address: Optional[str]
+    before_state: Optional[dict]
+    after_state: Optional[dict]
+    error_detail: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+class AuditReport(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    total_events: int
+    success_count: int
+    failure_count: int
+    denied_count: int
+    critical_events: int
+    top_users: List[dict]
+    top_resources: List[dict]
+    actions_breakdown: dict
+
+
+# ─────────────────────────────────────────────
+# FastAPI UYGULAMASI
+# ─────────────────────────────────────────────
+app = FastAPI(
+    title=APP_TITLE,
+    version=APP_VERSION,
+    description="Kurumsal düzeyde RBAC ve Denetim Sistemi REST API'si",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────
+# KİMLİK DOĞRULAMA ENDPOINT'LERİ
+# ─────────────────────────────────────────────
+@app.post("/auth/login", response_model=TokenResponse, tags=["Auth"])
+async def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    meta = get_request_meta(request)
+    user = db.query(User).filter_by(username=body.username).first()
+
+    def _fail(detail: str, error: str = None):
+        if user:
+            user.failed_login_attempts += 1
+            if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+                user.is_locked = True
+            db.flush()
+            audit_logger.log(
+                db, action=AuditAction.LOGIN, resource="auth",
+                result=AuditResult.FAILURE, user_id=user.id,
+                username=user.username, severity=AuditSeverity.CRITICAL,
+                error_detail=error, **meta,
+            )
+            db.commit()
+        raise HTTPException(status_code=401, detail=detail)
+
+    if not user or not verify_password(body.password, user.hashed_password):
+        _fail("Kullanıcı adı veya şifre hatalı.", "BAD_CREDENTIALS")
+
+    if not user.is_active:
+        _fail("Hesap devre dışı.", "INACTIVE")
+
+    if user.is_locked:
+        _fail("Hesap kilitli. Yöneticinizle iletişime geçin.", "LOCKED")
+
+    # Başarılı giriş
+    user.failed_login_attempts = 0
+    user.last_login = datetime.now(timezone.utc)
+
+    access_token  = create_token(
+        {"sub": str(user.id), "username": user.username, "type": "access"},
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    refresh_token = create_token(
+        {"sub": str(user.id), "username": user.username, "type": "refresh"},
+        timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES),
+    )
+
+    audit_logger.log(
+        db, action=AuditAction.LOGIN, resource="auth",
+        result=AuditResult.SUCCESS, user_id=user.id,
+        username=user.username, severity=AuditSeverity.LOW, **meta,
+    )
+    db.commit()
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
+
+
+@app.post("/auth/refresh", response_model=TokenResponse, tags=["Auth"])
+async def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
+    payload = decode_token(body.refresh_token)
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Yenileme tokeni gerekli.")
+    if is_token_blacklisted(payload["jti"], db):
+        raise HTTPException(status_code=401, detail="Token iptal edilmiş.")
+
+    user_id = int(payload["sub"])
+    user = db.query(User).filter_by(id=user_id, is_active=True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Kullanıcı bulunamadı.")
+
+    # Eski yenileme tokenini iptal et
+    db.add(TokenBlacklist(
+        jti=payload["jti"], user_id=user_id,
+        expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
+    ))
+    access_token  = create_token(
+        {"sub": str(user.id), "username": user.username, "type": "access"},
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    refresh_token = create_token(
+        {"sub": str(user.id), "username": user.username, "type": "refresh"},
+        timedelta(minutes=REFRESH_TOKEN_EXPIRE_MINUTES),
+    )
+    audit_logger.log(
+        db, action=AuditAction.TOKEN_REFRESH, resource="auth",
+        result=AuditResult.SUCCESS, user_id=user.id, username=user.username,
+        severity=AuditSeverity.LOW,
+    )
+    db.commit()
+    return TokenResponse(access_token=access_token, refresh_token=refresh_token)
+
+
+@app.post("/auth/logout", status_code=204, tags=["Auth"])
+async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    current_user: User = Depends(get_current_user),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    payload = decode_token(credentials.credentials)
+    expires = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+    db.add(TokenBlacklist(jti=payload["jti"], user_id=current_user.id, expires_at=expires))
+    meta = get_request_meta(request) if request else {}
+    audit_logger.log(
+        db, action=AuditAction.LOGOUT, resource="auth",
+        result=AuditResult.SUCCESS, user_id=current_user.id,
+        username=current_user.username, severity=AuditSeverity.LOW, **meta,
+    )
+    db.commit()
+
+
+# ─────────────────────────────────────────────
+# KULLANICI ENDPOINT'LERİ
+# ─────────────────────────────────────────────
+@app.get("/users", response_model=List[UserOut], tags=["Kullanıcılar"])
+async def list_users(
+    current_user: User = Depends(require_permission("users", "read")),
+    db: Session = Depends(get_db),
+    skip: int = 0, limit: int = 50,
+):
+    users = db.query(User).offset(skip).limit(limit).all()
+    return [UserOut.from_orm_with_roles(u) for u in users]
+
+
+@app.post("/users", response_model=UserOut, status_code=201, tags=["Kullanıcılar"])
+async def create_user(
+    body: UserCreate,
+    request: Request,
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    if db.query(User).filter_by(username=body.username).first():
+        raise HTTPException(400, "Kullanıcı adı zaten kullanımda.")
+    if db.query(User).filter_by(email=body.email).first():
+        raise HTTPException(400, "E-posta zaten kullanımda.")
+
+    user = User(
+        username=body.username, email=body.email,
+        full_name=body.full_name,
+        hashed_password=hash_password(body.password),
+    )
+    db.add(user)
+    db.flush()
+    audit_logger.log(
+        db, action=AuditAction.CREATE, resource="users",
+        resource_id=user.id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.MEDIUM,
+        after_state={"username": user.username, "email": user.email},
+        **meta,
+    )
+    db.commit()
+    db.refresh(user)
+    return UserOut.from_orm_with_roles(user)
+
+
+@app.get("/users/{user_id}", response_model=UserOut, tags=["Kullanıcılar"])
+async def get_user(
+    user_id: int,
+    current_user: User = Depends(require_permission("users", "read")),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise HTTPException(404, "Kullanıcı bulunamadı.")
+    return UserOut.from_orm_with_roles(user)
+
+
+@app.put("/users/{user_id}", response_model=UserOut, tags=["Kullanıcılar"])
+async def update_user(
+    user_id: int,
+    body: UserUpdate,
+    request: Request,
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise HTTPException(404, "Kullanıcı bulunamadı.")
+
+    before = {"email": user.email, "full_name": user.full_name, "is_active": user.is_active}
+    if body.email is not None:    user.email     = body.email
+    if body.full_name is not None: user.full_name = body.full_name
+    if body.is_active is not None: user.is_active = body.is_active
+
+    audit_logger.log(
+        db, action=AuditAction.UPDATE, resource="users",
+        resource_id=user_id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.MEDIUM, before_state=before,
+        after_state=body.model_dump(exclude_none=True), **meta,
+    )
+    db.commit()
+    db.refresh(user)
+    return UserOut.from_orm_with_roles(user)
+
+
+@app.delete("/users/{user_id}", status_code=204, tags=["Kullanıcılar"])
+async def delete_user(
+    user_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("users", "delete")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise HTTPException(404, "Kullanıcı bulunamadı.")
+    if user.id == current_user.id:
+        raise HTTPException(400, "Kendi hesabınızı silemezsiniz.")
+
+    snapshot = {"username": user.username, "email": user.email}
+    db.delete(user)
+    audit_logger.log(
+        db, action=AuditAction.DELETE, resource="users",
+        resource_id=user_id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.HIGH, before_state=snapshot, **meta,
+    )
+    db.commit()
+
+
+@app.post("/users/{user_id}/roles", status_code=201, tags=["Kullanıcılar"])
+async def assign_role(
+    user_id: int,
+    body: AssignRole,
+    request: Request,
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise HTTPException(404, "Kullanıcı bulunamadı.")
+    role = db.query(Role).filter_by(id=body.role_id, is_active=True).first()
+    if not role:
+        raise HTTPException(404, "Rol bulunamadı.")
+
+    existing = db.query(UserRole).filter_by(user_id=user_id, role_id=body.role_id).first()
+    if existing:
+        existing.is_active = True
+        existing.expires_at = body.expires_at
+    else:
+        db.add(UserRole(
+            user_id=user_id, role_id=body.role_id,
+            assigned_by_id=current_user.id, expires_at=body.expires_at,
+        ))
+
+    audit_logger.log(
+        db, action=AuditAction.ASSIGN_ROLE, resource="users",
+        resource_id=user_id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.HIGH,
+        after_state={"role": role.name, "user": user.username}, **meta,
+    )
+    db.commit()
+    return {"message": f"'{role.name}' rolü '{user.username}' kullanıcısına atandı."}
+
+
+@app.delete("/users/{user_id}/roles/{role_id}", status_code=204, tags=["Kullanıcılar"])
+async def revoke_role(
+    user_id: int, role_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("users", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    ur = db.query(UserRole).filter_by(user_id=user_id, role_id=role_id).first()
+    if not ur:
+        raise HTTPException(404, "Atama bulunamadı.")
+    role_name = ur.role.name
+    ur.is_active = False
+    audit_logger.log(
+        db, action=AuditAction.REVOKE_ROLE, resource="users",
+        resource_id=user_id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.HIGH,
+        before_state={"role": role_name}, **meta,
+    )
+    db.commit()
+
+
+# ─────────────────────────────────────────────
+# ROL ENDPOINT'LERİ
+# ─────────────────────────────────────────────
+@app.get("/roles", response_model=List[RoleOut], tags=["Roller"])
+async def list_roles(
+    current_user: User = Depends(require_permission("roles", "read")),
+    db: Session = Depends(get_db),
+):
+    roles = db.query(Role).filter_by(is_active=True).all()
+    return [
+        RoleOut(
+            id=r.id, name=r.name, display_name=r.display_name,
+            description=r.description, is_system=r.is_system,
+            parent_id=r.parent_id,
+            permissions=[f"{p.resource}:{p.action}" for p in r.permissions],
+        )
+        for r in roles
+    ]
+
+
+@app.post("/roles", response_model=RoleOut, status_code=201, tags=["Roller"])
+async def create_role(
+    body: RoleCreate,
+    request: Request,
+    current_user: User = Depends(require_permission("roles", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    if db.query(Role).filter_by(name=body.name).first():
+        raise HTTPException(400, "Bu isimde rol zaten mevcut.")
+
+    role = Role(
+        name=body.name, display_name=body.display_name,
+        description=body.description, parent_id=body.parent_id,
+    )
+    db.add(role)
+    db.flush()
+    audit_logger.log(
+        db, action=AuditAction.CREATE, resource="roles",
+        resource_id=role.id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.HIGH, after_state={"name": role.name}, **meta,
+    )
+    db.commit()
+    db.refresh(role)
+    return RoleOut(
+        id=role.id, name=role.name, display_name=role.display_name,
+        description=role.description, is_system=role.is_system,
+        parent_id=role.parent_id, permissions=[],
+    )
+
+
+@app.post("/roles/{role_id}/permissions", status_code=201, tags=["Roller"])
+async def assign_permission_to_role(
+    role_id: int,
+    body: AssignPermission,
+    request: Request,
+    current_user: User = Depends(require_permission("roles", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    role = db.query(Role).filter_by(id=role_id).first()
+    if not role:
+        raise HTTPException(404, "Rol bulunamadı.")
+    perm = db.query(Permission).filter_by(id=body.permission_id, is_active=True).first()
+    if not perm:
+        raise HTTPException(404, "İzin bulunamadı.")
+
+    existing = db.query(RolePermission).filter_by(role_id=role_id, permission_id=body.permission_id).first()
+    if existing:
+        existing.is_active = True
+    else:
+        db.add(RolePermission(
+            role_id=role_id, permission_id=body.permission_id,
+            granted_by_id=current_user.id,
+        ))
+
+    audit_logger.log(
+        db, action=AuditAction.GRANT_PERM, resource="roles",
+        resource_id=role_id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.HIGH,
+        after_state={"role": role.name, "permission": perm.name}, **meta,
+    )
+    db.commit()
+    return {"message": f"'{perm.name}' izni '{role.name}' rolüne verildi."}
+
+
+# ─────────────────────────────────────────────
+# İZİN ENDPOINT'LERİ
+# ─────────────────────────────────────────────
+@app.get("/permissions", response_model=List[PermissionOut], tags=["İzinler"])
+async def list_permissions(
+    current_user: User = Depends(require_permission("permissions", "read")),
+    db: Session = Depends(get_db),
+):
+    return db.query(Permission).filter_by(is_active=True).all()
+
+
+@app.post("/permissions", response_model=PermissionOut, status_code=201, tags=["İzinler"])
+async def create_permission(
+    body: PermissionCreate,
+    request: Request,
+    current_user: User = Depends(require_permission("permissions", "write")),
+    db: Session = Depends(get_db),
+):
+    meta = get_request_meta(request)
+    name = f"{body.resource}:{body.action}"
+    if db.query(Permission).filter_by(name=name).first():
+        raise HTTPException(400, "Bu izin zaten tanımlı.")
+
+    perm = Permission(name=name, resource=body.resource, action=body.action, description=body.description)
+    db.add(perm)
+    db.flush()
+    audit_logger.log(
+        db, action=AuditAction.CREATE, resource="permissions",
+        resource_id=perm.id, result=AuditResult.SUCCESS,
+        user_id=current_user.id, username=current_user.username,
+        severity=AuditSeverity.HIGH, after_state={"name": name}, **meta,
+    )
+    db.commit()
+    db.refresh(perm)
+    return perm
+
+
+# ─────────────────────────────────────────────
+# DENETİM ENDPOINT'LERİ
+# ─────────────────────────────────────────────
+@app.get("/audit/logs", response_model=List[AuditLogOut], tags=["Denetim"])
+async def get_audit_logs(
+    current_user: User = Depends(require_permission("audit", "read")),
+    db: Session = Depends(get_db),
+    skip: int = 0, limit: int = 100,
+    action: Optional[str] = None,
+    resource: Optional[str] = None,
+    result: Optional[str] = None,
+    severity: Optional[str] = None,
+    user_id: Optional[int] = None,
+):
+    q = db.query(AuditLog)
+    if action:   q = q.filter(AuditLog.action == action)
+    if resource: q = q.filter(AuditLog.resource == resource)
+    if result:   q = q.filter(AuditLog.result == result)
+    if severity: q = q.filter(AuditLog.severity == severity)
+    if user_id:  q = q.filter(AuditLog.user_id == user_id)
+    return q.order_by(AuditLog.timestamp.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/audit/logs/{log_id}", response_model=AuditLogOut, tags=["Denetim"])
+async def get_audit_log(
+    log_id: int,
+    current_user: User = Depends(require_permission("audit", "read")),
+    db: Session = Depends(get_db),
+):
+    log = db.query(AuditLog).filter_by(id=log_id).first()
+    if not log:
+        raise HTTPException(404, "Denetim kaydı bulunamadı.")
+    return log
+
+
+@app.get("/audit/user/{user_id}", response_model=List[AuditLogOut], tags=["Denetim"])
+async def get_user_activity(
+    user_id: int,
+    current_user: User = Depends(require_permission("audit", "read")),
+    db: Session = Depends(get_db),
+    limit: int = 50,
+):
+    return (
+        db.query(AuditLog)
+        .filter_by(user_id=user_id)
+        .order_by(AuditLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+@app.get("/audit/report", response_model=AuditReport, tags=["Denetim"])
+async def audit_report(
+    current_user: User = Depends(require_permission("audit", "read")),
+    db: Session = Depends(get_db),
+    days: int = 30,
+):
+    from sqlalchemy import func, desc
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    logs = db.query(AuditLog).filter(AuditLog.timestamp >= since)
+
+    total    = logs.count()
+    success  = logs.filter_by(result=AuditResult.SUCCESS).count()
+    failure  = logs.filter_by(result=AuditResult.FAILURE).count()
+    denied   = logs.filter_by(result=AuditResult.DENIED).count()
+    critical = logs.filter_by(severity=AuditSeverity.CRITICAL).count()
+
+    top_users_raw = (
+        db.query(AuditLog.username, func.count(AuditLog.id).label("cnt"))
+        .filter(AuditLog.timestamp >= since)
+        .group_by(AuditLog.username)
+        .order_by(desc("cnt"))
+        .limit(10)
+        .all()
+    )
+    top_resources_raw = (
+        db.query(AuditLog.resource, func.count(AuditLog.id).label("cnt"))
+        .filter(AuditLog.timestamp >= since)
+        .group_by(AuditLog.resource)
+        .order_by(desc("cnt"))
+        .limit(10)
+        .all()
+    )
+    actions_raw = (
+        db.query(AuditLog.action, func.count(AuditLog.id).label("cnt"))
+        .filter(AuditLog.timestamp >= since)
+        .group_by(AuditLog.action)
+        .all()
+    )
+
+    return AuditReport(
+        period_start=since, period_end=datetime.now(timezone.utc),
+        total_events=total, success_count=success,
+        failure_count=failure, denied_count=denied,
+        critical_events=critical,
+        top_users=[{"username": r[0], "count": r[1]} for r in top_users_raw],
+        top_resources=[{"resource": r[0], "count": r[1]} for r in top_resources_raw],
+        actions_breakdown={r[0]: r[1] for r in actions_raw},
+    )
+
+
+# ─────────────────────────────────────────────
+# KENDİM — Mevcut Kullanıcı
+# ─────────────────────────────────────────────
+@app.get("/me", response_model=UserOut, tags=["Profil"])
+async def me(current_user: User = Depends(get_current_user)):
+    return UserOut.from_orm_with_roles(current_user)
+
+@app.get("/me/permissions", tags=["Profil"])
+async def my_permissions(current_user: User = Depends(get_current_user)):
+    return {"permissions": rbac_engine.get_user_permissions(current_user)}
+
+@app.get("/me/check", tags=["Profil"])
+async def check_my_permission(
+    resource: str, action: str,
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "resource": resource, "action": action,
+        "allowed": rbac_engine.has_permission(current_user, resource, action),
+    }
+
+
+# ─────────────────────────────────────────────
+# SAĞLIK KONTROLÜ
+# ─────────────────────────────────────────────
+@app.get("/health", tags=["Sistem"])
+async def health():
+    return {"status": "ok", "version": APP_VERSION, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+# ─────────────────────────────────────────────
+# UYGULAMA BAŞLANGICI — Veritabanı + Seed
+# ─────────────────────────────────────────────
+def seed_database(db: Session):
+    """Varsayılan roller, izinler ve yönetici kullanıcısı oluşturur."""
+
+    # ── İzinler ──────────────────────────────
+    base_permissions = [
+        ("users",       "read"),   ("users",       "write"),  ("users",  "delete"),
+        ("roles",       "read"),   ("roles",       "write"),
+        ("permissions", "read"),   ("permissions", "write"),
+        ("audit",       "read"),
+        ("reports",     "read"),   ("reports",     "export"),
+        ("settings",    "read"),   ("settings",    "write"),
+        ("*",           "*"),
+    ]
+    perm_objs: Dict[str, Permission] = {}
+    for resource, action in base_permissions:
+        name = f"{resource}:{action}"
+        p = db.query(Permission).filter_by(name=name).first()
+        if not p:
+            p = Permission(name=name, resource=resource, action=action,
+                           description=f"{resource} kaynak üzerinde {action} yetkisi")
+            db.add(p)
+            db.flush()
+        perm_objs[name] = p
+
+    # ── Roller ───────────────────────────────
+    role_defs = [
+        ("super_admin", "Süper Yönetici", None,          True,  ["*:*"]),
+        ("admin",       "Yönetici",       "super_admin", True,  [
+            "users:read","users:write","users:delete",
+            "roles:read","roles:write","permissions:read","permissions:write",
+            "audit:read","reports:read","reports:export","settings:read","settings:write",
+        ]),
+        ("manager",     "Yöner",          "admin",       True,  [
+            "users:read","users:write","reports:read","reports:export",
+        ]),
+        ("auditor",     "Denetçi",        None,          True,  [
+            "audit:read","users:read","reports:read",
+        ]),
+        ("user",        "Kullanıcı",      "manager",     True,  [
+            "users:read",
+        ]),
+    ]
+    role_objs: Dict[str, Role] = {}
+    for name, dname, parent_name, is_sys, perms in role_defs:
+        r = db.query(Role).filter_by(name=name).first()
+        if not r:
+            parent = role_objs.get(parent_name) if parent_name else None
+            r = Role(name=name, display_name=dname, is_system=is_sys,
+                     parent_id=parent.id if parent else None)
+            db.add(r)
+            db.flush()
+        role_objs[name] = r
+
+        for pname in perms:
+            perm = perm_objs.get(pname)
+            if perm and not db.query(RolePermission).filter_by(role_id=r.id, permission_id=perm.id).first():
+                db.add(RolePermission(role_id=r.id, permission_id=perm.id))
+
+    # ── Yönetici Kullanıcı ───────────────────
+    admin_pass = os.getenv("ADMIN_PASSWORD", "Admin@123!")
+    if not db.query(User).filter_by(username="admin").first():
+        admin = User(
+            username="admin", email="admin@example.com",
+            full_name="Sistem Yöneticisi",
+            hashed_password=hash_password(admin_pass),
+        )
+        db.add(admin)
+        db.flush()
+        db.add(UserRole(user_id=admin.id, role_id=role_objs["super_admin"].id))
+        logger.info("✅ Yönetici oluşturuldu: admin / %s", admin_pass)
+
+    db.commit()
+    logger.info("✅ Veritabanı seed tamamlandı.")
+
+
+@app.on_event("startup")
+async def startup():
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        seed_database(db)
+    logger.info("🚀 %s v%s başlatıldı", APP_TITLE, APP_VERSION)
+    logger.info("📖 API Belgeleri: http://localhost:8000/docs")
+
+
+# ─────────────────────────────────────────────
+# GİRİŞ NOKTASI
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    uvicorn.run(
+        "rbac_audit_system:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        reload=os.getenv("ENV", "production") == "development",
+        log_level="info",
+    )
