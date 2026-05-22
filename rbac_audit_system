@@ -1,0 +1,20 @@
+# İzin kontrolü
+from rbac_audit_system import check_permission
+
+has_access = check_permission(
+    user_id=42,
+    resource="reports",
+    action="export"
+)
+
+# Manuel denetim kaydı
+from rbac_audit_system import audit_logger
+
+audit_logger.log(
+    user_id=42,
+    action="EXPORT",
+    resource="reports",
+    resource_id="monthly-2024",
+    result="SUCCESS",
+    severity="HIGH"
+)
