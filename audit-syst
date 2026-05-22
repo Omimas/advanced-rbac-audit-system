@@ -1,0 +1,16 @@
+{
+  "id": "uuid",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "user_id": 42,
+  "username": "john.doe",
+  "action": "UPDATE",
+  "resource": "users",
+  "resource_id": "15",
+  "result": "SUCCESS",
+  "ip_address": "192.168.1.100",
+  "user_agent": "Mozilla/5.0...",
+  "before_state": {"role": "user"},
+  "after_state": {"role": "manager"},
+  "severity": "MEDIUM",
+  "session_id": "sess_abc123"
+}
